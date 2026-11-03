@@ -4,21 +4,45 @@ on:
   push:
     branches:
       - main
-    # Only the label definitions matter here; ".github/**" re-synced on every
-    # workflow edit, which was a no-op the overwhelming majority of the time.
     paths:
+      # Only the label definitions and this workflow matter; ".github/**" re-synced on every unrelated
+      # workflow edit. The workflow itself is included so a change to the sync logic is exercised on merge.
       - ".github/labels.toml"
+      - ".github/workflows/labels.yml"
 
 jobs:
   labels:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: 3.x
-      - name: Install labels
-        run: pip install labels
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # This used to run the `labels` PyPI package, but that project was last
+      # released in 2020 and builds its model with `Label(**api_json)`, so it
+      # dies on every field GitHub adds to the labels API — currently
+      # `archived_at`. The gh CLI ships on the runner and keeps the same
+      # contract: .github/labels.toml is the source of truth, labels are
+      # created or updated to match it, and remote labels missing from it are
+      # deleted. (tomllib needs Python 3.11+, which the runner image provides.)
       - name: Sync config with Github
-        run: labels -u ${{ github.repository_owner }} -t ${{ secrets.GH_PAT }} sync .github/labels.toml
+        env:
+          # No GH_PAT secret in this repo; the workflow token can manage labels with issues: write.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 -c 'import json, sys, tomllib; json.dump(list(tomllib.load(open(sys.argv[1], "rb")).values()), sys.stdout)' \
+            .github/labels.toml > "$RUNNER_TEMP/desired.json"
+
+          jq -r '.[] | [.name, .color, .description // ""] | @tsv' "$RUNNER_TEMP/desired.json" |
+            while IFS=$'\t' read -r name color description; do
+              gh label create "$name" --color "$color" --description "$description" --force
+            done
+
+          gh label list --limit 200 --json name --jq '.[].name' | sort > "$RUNNER_TEMP/remote.txt"
+          jq -r '.[].name' "$RUNNER_TEMP/desired.json" | sort > "$RUNNER_TEMP/desired.txt"
+
+          comm -23 "$RUNNER_TEMP/remote.txt" "$RUNNER_TEMP/desired.txt" |
+            while IFS= read -r name; do
+              gh label delete "$name" --yes
+            done
